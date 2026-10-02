@@ -18,8 +18,14 @@ export type StackPr = {
   headSha: string;
 };
 
-/** Bottom → top. `combined` is the whole stack's diff; empty for a lone PR. */
-export type PrStack = { prs: StackPr[]; combined: FileChange[] };
+/** Bottom → top. `combined` is the whole stack's diff; empty for a lone PR.
+ * `unrebased`: PR numbers not on top of the PR below — line ownership cannot
+ * be computed across them, so the combined view is refused. */
+export type PrStack = {
+  prs: StackPr[];
+  combined: FileChange[];
+  unrebased: number[];
+};
 
 /** Each layer's files, bottom → top, parallel to `PrStack.prs`. */
 export type StackLayers = ReadonlyArray<readonly FileChange[]>;

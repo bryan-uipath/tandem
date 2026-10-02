@@ -92,9 +92,11 @@ describe("routeComment", () => {
     });
   });
   it("keeps a range within one owner", () => {
-    expect(routeComment(layers, "f", "RIGHT", 2, 1)).toEqual({
-      layer: 0,
-      line: 3,
+    // D (PR2 added) and e (PR2 context) both belong to PR2.
+    expect(routeComment(layers, "f", "RIGHT", 5, 4)).toEqual({
+      layer: 1,
+      line: 6,
+      startLine: 5,
     });
   });
 });

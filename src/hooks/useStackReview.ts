@@ -1,7 +1,13 @@
 // SPIKE: review a whole PR stack as one combined diff. Every comment is stored
 // in its OWNING PR's draft, in that PR's coordinates (shared/gh/stack.ts maps
 // both ways), so collapsing back to one PR loses nothing.
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useQueries,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { toast } from "@uipath/apollo-wind";
 import { useState } from "react";
 import { fetchPrFiles, fetchPrStack, submitPr } from "../api/prs";
 import { fetchReview, putReview } from "../api/reviews";
@@ -19,6 +25,7 @@ import {
   type StackPr,
 } from "../shared/gh/stack";
 import type {
+  DiffSide,
   FileChange,
   PendingComment,
   PendingReview,
@@ -28,12 +35,14 @@ import type {
 import { hasOpenBlocker, runFor, type RunsIndex } from "./useAgentRuns";
 import { emptyReview } from "./usePendingReview";
 
-export type StackSubmitResult = { pr: StackPr; error?: string; url?: string };
+export type StackSubmitResult = { pr: StackPr; error?: string };
 
 export function useStackReview(
   prId: PrId,
   headSha: string | undefined,
   runsIndex: RunsIndex | undefined,
+  /** Stack mode is on: only then load every layer's files and draft. */
+  active: boolean,
 ) {
   const queryClient = useQueryClient();
   const stack = useQuery({
@@ -51,6 +60,7 @@ export function useStackReview(
       queryKey: ["pr", "files", pr.prId, pr.headSha],
       queryFn: ({ signal }: { signal: AbortSignal }) =>
         fetchPrFiles(pr.prId, signal),
+      enabled: active,
       staleTime: Infinity,
       refetchOnWindowFocus: false,
     })),
@@ -62,14 +72,17 @@ export function useStackReview(
     queries: prs.map((pr) => ({
       queryKey: ["review", pr.prId],
       queryFn: () => fetchReview(pr.prId),
+      enabled: active,
       staleTime: Infinity,
       refetchOnWindowFocus: false,
     })),
     combine: combineDrafts,
   });
-  const layers = layerQueries;
-  const layersReady = layers !== null;
-  const drafts = draftQueries;
+  // Ready only once every layer's files AND draft are in: writing to a draft
+  // that has not loaded would replace its saved comments with the new one.
+  const ready = layerQueries !== null && draftQueries !== null;
+  const layers = ready ? layerQueries : null;
+  const drafts = draftQueries ?? NO_DRAFTS;
 
   // Each PR's run at its own head, and its open findings moved onto the
   // combined diff. Accepting one stages it in THAT PR's draft (addComment).
@@ -85,70 +98,73 @@ export function useStackReview(
       v.includes(path) ? v.filter((p) => p !== path) : [...v, path],
     );
 
-  /** Optimistic write of one layer's draft, reconciled from the PUT's echo. */
-  const writeDraft = async (
+  const writeDraft = (
     layer: number,
     edit: (d: PendingReview) => PendingReview,
-  ) => {
-    const pr = prs[layer];
-    const key = ["review", pr.prId];
-    const current =
-      queryClient.getQueryData<PendingReview | null>(key) ??
-      emptyReview(pr.prId, pr.headSha);
-    const next = edit(current);
-    queryClient.setQueryData(key, next);
-    queryClient.setQueryData(key, await putReview(next));
-  };
+  ) => saveDraft(queryClient, prs[layer], edit);
 
-  /** Route a combined-diff comment to its owner. Returns the owner, or null.
-   * An accepted finding skips the routing: it goes to its own run's PR, at
-   * the lines that run anchored it to. */
-  const addComment = (
+  /** Where a combined-diff comment lands: its owner layer and anchor there. */
+  const targetOf = (
     comment: Omit<PendingComment, "localId">,
-  ): StackPr | null => {
+  ):
+    | {
+        layer: number;
+        path: string;
+        side: DiffSide;
+        line: number;
+        startLine?: number;
+      }
+    | { error: string } => {
     const found = comment.findingId
       ? agent.owner.get(comment.findingId)
       : undefined;
     if (found) {
-      const { layer, finding } = found;
-      void writeDraft(layer, (d) => ({
-        ...d,
-        comments: [
-          ...d.comments,
-          {
-            ...comment,
-            path: finding.path,
-            side: finding.side,
-            line: finding.endLine,
-            startLine: finding.startLine,
-            localId: crypto.randomUUID(),
-          },
-        ],
-      }));
-      return prs[layer];
+      const { path, side, endLine, startLine } = found.finding;
+      return { layer: found.layer, path, side, line: endLine, startLine };
     }
-    if (!layers) return null;
-    const routed = routeComment(
-      layers,
-      comment.path,
-      comment.side,
-      comment.line,
-      comment.startLine,
-    );
-    if (!routed) return null;
-    void writeDraft(routed.layer, (d) => ({
+    const routed = layers
+      ? routeComment(
+          layers,
+          comment.path,
+          comment.side,
+          comment.line,
+          comment.startLine,
+        )
+      : null;
+    if (!routed)
+      return { error: "No PR in the stack can take a comment there" };
+    // A suggestion replaces exactly its lines; one whose range the routing cut
+    // short would replace fewer lines than it was written for.
+    if (
+      comment.suggestion !== undefined &&
+      spanLength(routed.startLine, routed.line) !==
+        spanLength(comment.startLine, comment.line)
+    )
+      return {
+        error:
+          "That range spans more than one PR — select lines from one PR to suggest a change",
+      };
+    return { ...routed, path: comment.path, side: comment.side };
+  };
+
+  /**
+   * Route a combined-diff comment to its owner. An accepted finding skips the
+   * routing: it goes to its own run's PR, at the lines that run anchored it to.
+   */
+  const addComment = (
+    comment: Omit<PendingComment, "localId">,
+  ): { pr: StackPr } | { error: string } => {
+    const target = targetOf(comment);
+    if ("error" in target) return target;
+    const { layer, ...anchor } = target;
+    void writeDraft(layer, (d) => ({
       ...d,
       comments: [
         ...d.comments,
-        {
-          ...comment,
-          line: routed.line,
-          startLine: routed.startLine,
-          localId: crypto.randomUUID(),
-        },
+        { ...comment, ...anchor, localId: crypto.randomUUID() },
       ],
     }));
-    return prs[routed.layer];
+    return { pr: prs[layer] };
   };
 
   const updateComment = (localId: string, patch: Partial<PendingComment>) => {
@@ -201,8 +217,8 @@ export function useStackReview(
       if (verdict === "COMMENT" && staged === 0 && !summaryBody.trim())
         continue;
       try {
-        const { url } = await submitPr(pr.prId, { verdict, summaryBody });
-        results.push({ pr, url });
+        await submitPr(pr.prId, { verdict, summaryBody });
+        results.push({ pr });
       } catch (e) {
         results.push({ pr, error: e instanceof Error ? e.message : String(e) });
       }
@@ -216,7 +232,9 @@ export function useStackReview(
     prs,
     isPending: stack.isPending,
     /** The combined diff, once every layer's files are in (ownership needs them). */
-    combined: layersReady ? (stack.data?.combined ?? null) : null,
+    combined: ready ? (stack.data?.combined ?? null) : null,
+    /** PR numbers not rebased on the PR below — the combined view is refused. */
+    unrebased: stack.data?.unrebased ?? NO_NUMBERS,
     top: prs.length > 0 ? prs[prs.length - 1] : null,
     comments: projected,
     hiddenComments: hidden,
@@ -249,6 +267,8 @@ export function useStackReview(
 export type StackReview = ReturnType<typeof useStackReview>;
 
 const NO_PRS: StackPr[] = [];
+const NO_DRAFTS: Array<PendingReview | null> = [];
+const NO_NUMBERS: number[] = [];
 
 /** Every layer's files, or null until all have loaded (ownership needs all). */
 function combineLayers(
@@ -258,10 +278,50 @@ function combineLayers(
   return results.map((r) => r.data ?? []);
 }
 
+/** Every layer's draft (null = none saved), or null until all have loaded. */
 function combineDrafts(
-  results: Array<{ data?: PendingReview | null }>,
-): Array<PendingReview | null> {
+  results: Array<{ data?: PendingReview | null; isSuccess: boolean }>,
+): Array<PendingReview | null> | null {
+  if (results.length === 0 || results.some((r) => !r.isSuccess)) return null;
   return results.map((r) => r.data ?? null);
+}
+
+function spanLength(startLine: number | undefined, line: number): number {
+  return line - (startLine ?? line) + 1;
+}
+
+// Per-PR save queue. Writes are serialized, and only the newest write's echo
+// reaches the cache: an older PUT answering late would otherwise replace the
+// optimistic draft and the next write would persist it, dropping a comment.
+const saveTail = new Map<PrId, Promise<void>>();
+const saveSeq = new Map<PrId, number>();
+
+function saveDraft(
+  queryClient: QueryClient,
+  pr: StackPr,
+  edit: (d: PendingReview) => PendingReview,
+): Promise<void> {
+  const key = ["review", pr.prId];
+  const next = edit(
+    queryClient.getQueryData<PendingReview | null>(key) ??
+      emptyReview(pr.prId, pr.headSha),
+  );
+  queryClient.setQueryData(key, next);
+  const seq = (saveSeq.get(pr.prId) ?? 0) + 1;
+  saveSeq.set(pr.prId, seq);
+  const run = (saveTail.get(pr.prId) ?? Promise.resolve())
+    .then(() => putReview(next))
+    .then((saved) => {
+      if (saveSeq.get(pr.prId) === seq) queryClient.setQueryData(key, saved);
+    })
+    .catch((e: unknown) => {
+      toast.error("Draft could not be saved", {
+        description: e instanceof Error ? e.message : undefined,
+      });
+      void queryClient.invalidateQueries({ queryKey: key });
+    });
+  saveTail.set(pr.prId, run);
+  return run;
 }
 
 /** Open findings from every layer's run, in combined coordinates. */

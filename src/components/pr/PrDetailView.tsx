@@ -37,13 +37,12 @@ import { hasOpenBlocker, runFor, useAgentRuns } from "../../hooks/useAgentRuns";
 import { usePendingReview } from "../../hooks/usePendingReview";
 import { usePrDetail, usePrFiles } from "../../hooks/usePrDetail";
 import { useStackReview } from "../../hooks/useStackReview";
-import { parsePrId } from "../../shared/gh/prKey";
-import type { StackPr } from "../../shared/gh/stack";
 import { useRunStream } from "../../hooks/useRunStream";
 import { useMarkSeen } from "../../hooks/useSeen";
 import { useSettings } from "../../hooks/useSettings";
 import { hasOpenDialog, isTypingTarget } from "../../keyboard/keyOwnership";
-import { navigate, navigateToQueue } from "../../routes";
+import { navigateToQueue } from "../../routes";
+import { openPrDetail } from "../../hooks/useKeyboardNav";
 import {
   openFindings,
   type AgentRun,
@@ -215,19 +214,21 @@ export function PrDetailView({ prId }: { prId: PrId }) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   // SPIKE: the whole stack as one combined diff. Comments route to the owning
   // PR's draft; threads and findings are off in this mode.
-  const stack = useStackReview(prId, headSha, runs.data);
   const stackMode = useUiStore((s) => s.prStackMode);
   const setStackMode = useUiStore((s) => s.setPrStackMode);
-  const stackOn = stackMode && stack.combined !== null;
-  const addStackComment = (comment: Omit<PendingComment, "localId">) => {
-    const owner = stack.addComment(comment);
-    if (owner) toast.success(`Staged on #${owner.number}`);
-    else toast.error("No PR in the stack can take a comment there");
+  const stack = useStackReview(prId, headSha, runs.data, stackMode);
+  // An unrebased stack has no line ownership to compute, so no combined view.
+  const stackBlocked = stack.unrebased.length > 0;
+  const stackOn = stackMode && !stackBlocked && stack.combined !== null;
+  const toggleStack = () => {
+    // The composer's line is in the coordinates of the view it was opened in.
+    useUiStore.getState().setComposerTarget(null);
+    setStackMode((on) => !on);
   };
-  // Down (toward trunk) / up the stack. A new PR remounts this screen.
-  const goToStackPr = (target: StackPr) => {
-    const ref = parsePrId(target.prId);
-    if (ref) navigate({ name: "pr", prId: target.prId, ...ref });
+  const addStackComment = (comment: Omit<PendingComment, "localId">) => {
+    const result = stack.addComment(comment);
+    if ("error" in result) toast.error(result.error);
+    else toast.success(`Staged on #${result.pr.number}`);
   };
   const stepStack = (delta: 1 | -1) => {
     if (stack.isPending) {
@@ -236,7 +237,8 @@ export function PrDetailView({ prId }: { prId: PrId }) {
     }
     const idx = stack.prs.findIndex((p) => p.prId === prId);
     const target = idx === -1 ? undefined : stack.prs[idx + delta];
-    if (target) goToStackPr(target);
+    // A new PR remounts this screen; stack mode is store state, so it stays.
+    if (target) openPrDetail(target.prId);
   };
   const files = stackOn ? (stack.combined ?? undefined) : filesQuery.data;
   const description = usePrDescription(
@@ -936,26 +938,31 @@ export function PrDetailView({ prId }: { prId: PrId }) {
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-mono shrink-0">
                     diff
                   </span>
-                  {/* What the diff IS — file count and churn — sits with the
-                      diff, not up in the PR meta row where it read as one more
-                      statistic about the pull request. `pr.changedFiles`, not
-                      `files.length`: the files endpoint windows its list, so on
-                      a large PR the two disagree and only one of them is the
-                      honest answer. */}
                   {stack.prs.length > 1 ? (
                     <Button
                       size="3xs"
                       variant={stackOn ? "default" : "outline"}
                       className="shrink-0"
                       aria-pressed={stackOn}
-                      disabled={!stackOn && stack.combined === null}
-                      onClick={() => setStackMode((on) => !on)}
+                      disabled={stackBlocked}
+                      title={
+                        stackBlocked
+                          ? `${stack.unrebased.map((n) => `#${n}`).join(", ")} is not rebased on the PR below`
+                          : undefined
+                      }
+                      onClick={toggleStack}
                     >
-                      {stackOn ? "Whole stack" : `Stack · ${stack.prs.length}`}
+                      {stackOn
+                        ? "Whole stack"
+                        : stackMode && !stackBlocked
+                          ? "Stack · loading"
+                          : `Stack · ${stack.prs.length}`}
                     </Button>
                   ) : null}
+                  {/* The chain truncates rather than pushing the controls to
+                      its right out of a row that never wraps. */}
                   {stack.prs.length > 1 ? (
-                    <span className="font-mono text-[11px] shrink-0 text-muted-foreground">
+                    <span className="font-mono text-[11px] min-w-0 truncate text-muted-foreground">
                       {stack.prs.map((p, i) => (
                         <span key={p.prId}>
                           {i > 0 ? " → " : ""}
@@ -966,7 +973,7 @@ export function PrDetailView({ prId }: { prId: PrId }) {
                               type="button"
                               className="hover:text-foreground hover:underline"
                               title={`${p.title} ({ / })`}
-                              onClick={() => goToStackPr(p)}
+                              onClick={() => openPrDetail(p.prId)}
                             >
                               #{p.number}
                             </button>
@@ -980,6 +987,10 @@ export function PrDetailView({ prId }: { prId: PrId }) {
                       {files.length} files
                     </span>
                   ) : (
+                    // What the diff IS — file count and churn — sits with the
+                    // diff, not up in the PR meta row. `pr.changedFiles`, not
+                    // `files.length`: the files endpoint windows its list, so
+                    // on a large PR only the former is honest.
                     <span className="font-mono text-[11px] min-w-0 truncate">
                       <span className="text-muted-foreground">
                         {pr.changedFiles} files
@@ -1046,6 +1057,9 @@ export function PrDetailView({ prId }: { prId: PrId }) {
                   className="flex-1 min-h-0 flex flex-col"
                 >
                   <DiffPane
+                    // The two views can share a head sha and item versions, so
+                    // CodeView would keep the other view's patch: remount.
+                    key={stackOn ? "stack" : "pr"}
                     prId={prId}
                     headSha={
                       stackOn && stack.top ? stack.top.headSha : pr.headSha
